@@ -94,7 +94,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     update_node(&mut map, &opt.root);
 
-    let root_name = opt.root.file_name().unwrap().to_str().unwrap();
+    let root_name = match opt.root.file_name(){
+        Some(p) => p.to_str(),
+        None => opt.root.to_str()
+    }.unwrap();
     let root_node = map.get(&opt.root).unwrap().clone();
     let root_string = format_node(root_name, root_node.1, 100., opt.show_percent);
 
@@ -181,7 +184,7 @@ fn is_hidden(entry: &walkdir::DirEntry) -> bool {
     entry
         .file_name()
         .to_str()
-        .map(|s| s.starts_with('.'))
+        .map(|s| s.starts_with('.') && s != ".")
         .unwrap_or(false)
 }
 
