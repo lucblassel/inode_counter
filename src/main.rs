@@ -1,4 +1,6 @@
+use anyhow::{Context, Result};
 use colored::{control, Colorize};
+use itertools::Itertools;
 use ptree::{
     print_tree_with,
     style::{Color, Style},
@@ -12,7 +14,6 @@ use std::{
 };
 use structopt::StructOpt;
 use walkdir::WalkDir;
-use itertools::Itertools;
 
 // Map with the directory as key, and as value
 // (Vec<children_directories>, inode_count, updated)
@@ -41,7 +42,7 @@ struct Opt {
     root: PathBuf,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<()> {
     let opt = Opt::from_args();
 
     if opt.ignore_colors {
@@ -68,37 +69,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if entry.path().is_dir() {
             map.insert(entry.path().to_owned(), (vec![], 1, false));
             if let Some(parent) = entry.path().parent() {
-                map.get_mut(parent).unwrap().0.push(entry.path().to_owned())
+                map.get_mut(parent)
+                    .context(format!("Parent {parent:?} not found."))?
+                    .0
+                    .push(entry.path().to_owned())
             }
             if entry.depth() == max_depth {
                 to_count.push(entry.path().to_owned())
             }
         } else {
-            map.get_mut(entry.path().parent().unwrap()).unwrap().1 += 1;
+            map.get_mut(
+                entry
+                    .path()
+                    .parent()
+                    .context(format!("Parent of {entry:?} not found."))?,
+            )
+            .context(format!("Could not find {entry:?} parent in map"))?
+            .1 += 1;
         }
     }
 
     let counts: Vec<_> = to_count
         .par_iter()
         .map(move |entry| {
-            let count = count_dir_inodes(entry, opt.show_hidden).unwrap();
+            let count = count_dir_inodes(entry, opt.show_hidden);
             (entry, count)
         })
         .collect();
 
     for (entry, count) in counts {
-        let child = map.get_mut(entry).unwrap();
+        let count = count.context(format!("Could not count inodes in {entry:?}"))?;
+        let child = map
+            .get_mut(entry)
+            .context(format!("Child {entry:?} not found"))?;
         child.1 += count;
         child.2 = true;
     }
 
-    update_node(&mut map, &opt.root);
+    update_node(&mut map, &opt.root)?;
 
-    let root_name = match opt.root.file_name(){
+    let root_name = match opt.root.file_name() {
         Some(p) => p.to_str(),
-        None => opt.root.to_str()
-    }.unwrap();
-    let root_node = map.get(&opt.root).unwrap().clone();
+        None => opt.root.to_str(),
+    }
+    .context(format!("Could not convert {:?} to string", opt.root))?;
+
+    let root_node = map
+        .get(&opt.root)
+        .context(format!("Root node {:?} not found", opt.root))?
+        .clone();
     let root_string = format_node(root_name, root_node.1, 100., opt.show_percent);
 
     let config = if opt.ignore_colors {
@@ -121,7 +140,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let count_b = map.get(*b).unwrap().1;
             Ord::cmp(&count_b, &count_a)
         }) {
-            print_node(&mut tree, child, &mut map, root_node.1, opt.show_percent);
+            print_node(&mut tree, child, &mut map, root_node.1, opt.show_percent)?;
         }
         print_tree_with(&tree.build(), &config)?;
         println!();
@@ -143,19 +162,22 @@ fn format_node(name: &str, count: usize, percent: f32, show_percent: bool) -> St
     }
 }
 
-fn update_node(map: &mut NodeMap, root: &Path) -> usize {
-    let mut node = map.get_mut(root).unwrap().clone();
+fn update_node(map: &mut NodeMap, root: &Path) -> Result<usize> {
+    let mut node = map
+        .get_mut(root)
+        .context(format!("Root node {:?} not found", root))?
+        .clone();
     if !node.2 {
         let mut count = node.1;
         for child in node.0.clone() {
-            count += update_node(map, &child)
+            count += update_node(map, &child)?
         }
         node.1 = count;
         node.2 = true;
         map.insert(root.to_owned(), node);
-        count
+        Ok(count)
     } else {
-        node.1
+        Ok(node.1)
     }
 }
 
@@ -165,19 +187,31 @@ fn print_node(
     map: &mut NodeMap,
     total: usize,
     show_percent: bool,
-) {
-    let count = update_node(map, root);
+) -> Result<()> {
+    let count = update_node(map, root)?;
     let p: f32 = (count as f32 / total as f32) * 100.0;
-    let display_name = root.file_name().unwrap().to_str().unwrap();
+    let display_name = root
+        .file_name()
+        .context(format!("Could not find file name of {root:?}"))?
+        .to_str()
+        .context("Could not convert filename to string")?;
     tree.begin_child(format_node(display_name, count, p, show_percent));
-    for child in map.get(root).unwrap().0.clone().iter().sorted_by(|a, b| {
+    let children = map
+        .get(root)
+        .context(format!("Could not find {root:?} in map."))?
+        .0
+        .clone();
+
+    for child in children.iter().sorted_by(|a, b| {
         let count_a = map.get(*a).unwrap().1;
         let count_b = map.get(*b).unwrap().1;
         Ord::cmp(&count_b, &count_a)
     }) {
-        print_node(tree, child, map, total, show_percent);
+        print_node(tree, child, map, total, show_percent)?;
     }
     tree.end_child();
+
+    Ok(())
 }
 
 fn is_hidden(entry: &walkdir::DirEntry) -> bool {
@@ -189,7 +223,7 @@ fn is_hidden(entry: &walkdir::DirEntry) -> bool {
 }
 
 // Counts the number of inodes in a directory
-fn count_dir_inodes<P: AsRef<Path>>(root: P, show_hidden: bool) -> io::Result<usize> {
+fn count_dir_inodes<P: AsRef<Path>>(root: P, show_hidden: bool) -> Result<usize> {
     let mut count = 0;
 
     let entries: Box<dyn Iterator<Item = walkdir::Result<walkdir::DirEntry>>> = if show_hidden {
@@ -204,18 +238,18 @@ fn count_dir_inodes<P: AsRef<Path>>(root: P, show_hidden: bool) -> io::Result<us
 
     for entry in entries {
         match entry {
-            Ok(_) => {},
+            Ok(_) => {}
             Err(err) => {
                 let path = err.path().unwrap_or_else(|| Path::new("")).display();
                 if let Some(inner) = err.io_error() {
                     match inner.kind() {
                         io::ErrorKind::PermissionDenied => {
                             eprintln!("Permission denied for: {path}")
-                        },
-                        _ => return Err(err.into_io_error().unwrap())
+                        }
+                        _ => return Err(err.into()),
                     }
                 }
-            },
+            }
         };
         count += 1;
     }
